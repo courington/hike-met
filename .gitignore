@@ -1,0 +1,29 @@
+# hike-met
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+
+# env
+.env
+
+# mac
+.DS_Store
+
+colorado_counties/*
+colorado_counties/.DS_Store
+colorado_counties/.gitignore
+colorado_counties/.git
+colorado_counties/.github
+colorado_counties/.vscode
+
+hiking-map/*
+hiking-map/.DS_Store
+hiking-map/.gitignore
+hiking-map/.git
+hiking-map/.github
+hiking-map/.vscode
