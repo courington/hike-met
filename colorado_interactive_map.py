@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import os
 import branca.colormap as cm
+from folium import plugins
 
 def create_interactive_hiking_map(trails_with_metrics, output_path, center_coords=None):
     """
@@ -34,10 +35,10 @@ def create_interactive_hiking_map(trails_with_metrics, output_path, center_coord
                       tiles='Stamen Terrain')
     
     # Add scale
-    folium.ScaleControl(imperial=True, metric=True).add_to(mymap)
+    folium.Scale().add_to(mymap)
     
     # Add fullscreen option
-    folium.plugins.Fullscreen().add_to(mymap)
+    plugins.Fullscreen().add_to(mymap)
     
     # Create colormaps for different metrics
     time_colormap = cm.linear.YlOrRd_09.scale(

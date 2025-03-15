@@ -1,0 +1,11 @@
+flask
+folium>=0.14.0
+geopandas
+requests
+numpy
+pandas
+shapely
+branca
+arcgis2geojson
+ratelimit
+urllib3==1.26.15
