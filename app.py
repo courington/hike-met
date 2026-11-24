@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 CALLS_PER_MINUTE = 6
 RESPONSE_CACHE_SIZE = 1000
 
+# (connect, read) timeouts in seconds. EPQS often takes 14-17s to answer for a
+# point it hasn't been asked about recently, so the read timeout needs headroom.
+REQUEST_TIMEOUT = (5, 45)
+
 # WGS84 ellipsoid, for measuring lon/lat geometries in meters
 GEOD = Geod(ellps='WGS84')
 
@@ -36,7 +40,7 @@ _response_cache = {}
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=60)
 def _throttled_get(url, params):
-    response = requests.get(url, params=params, timeout=10, headers={'Accept': 'application/json'})
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={'Accept': 'application/json'})
     response.raise_for_status()
     return response.json()
 
