@@ -1,0 +1,28 @@
+[project]
+name = "hike-met"
+version = "0.1.0"
+description = "Trail time, difficulty, and energy stats based on MET, terrain, and other factors."
+requires-python = ">=3.12"
+dependencies = [
+    "arcgis2geojson>=3.1.3",
+    "branca>=0.8.2",
+    "flask>=3.1.3",
+    "folium>=0.14.0",
+    "geopandas>=1.2.0",
+    "numpy>=2.5.5",
+    "pandas>=3.1.1",
+    "pyproj>=3.8.0",
+    "ratelimit>=2.2.1",
+    "requests>=2.34.2",
+    "shapely>=2.2.0",
+]
+
+[dependency-groups]
+analysis = [
+    "contextily>=1.7.1",
+    "matplotlib>=3.11.2",
+    "rasterio>=1.5.2",
+]
+
+[tool.uv]
+default-groups = ["analysis"]

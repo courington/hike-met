@@ -6,74 +6,83 @@ from arcgis2geojson import arcgis2geojson
 import requests
 import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString
 from shapely import wkt
+from pyproj import Geod
 import branca.colormap as cm
 # from colorado_hiking_model import calculate_colorado_hiking_metrics, get_colorado_landcover_penalty
 # from colorado_interactive_map import create_interactive_hiking_map
 from ratelimit import limits, sleep_and_retry
-from functools import lru_cache
+import json
 import time
 import logging
 from folium import plugins
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging. Set LOG_LEVEL=DEBUG to see request/response details.
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO').upper())
 logger = logging.getLogger(__name__)
 
-# Rate limiting decorators
+# Rate limiting
 CALLS_PER_MINUTE = 6
-RATE_LIMIT = 60 / CALLS_PER_MINUTE  # Seconds between calls
+RESPONSE_CACHE_SIZE = 1000
+
+# WGS84 ellipsoid, for measuring lon/lat geometries in meters
+GEOD = Geod(ellps='WGS84')
+
+# Successful responses only, keyed by (url, sorted params JSON), so a
+# timeout or error is retried on the next request instead of being cached.
+_response_cache = {}
 
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=60)
-@lru_cache(maxsize=1000)
-def rate_limited_get(url, params_str=None):
-    """Make a rate-limited GET request with error handling and caching"""
-    try:
-        # Convert string back to dict if provided
-        params = eval(params_str) if params_str else None
-        
-        # Set default headers
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        }
+def _throttled_get(url, params):
+    response = requests.get(url, params=params, timeout=10, headers={'Accept': 'application/json'})
+    response.raise_for_status()
+    return response.json()
 
-        response = requests.get(url, params=params, timeout=10, headers=headers)
-        response.raise_for_status()
-        return response.json()
+def rate_limited_get(url, params=None):
+    """Make a rate-limited, cached GET request. Returns parsed JSON or None on failure."""
+    key = (url, json.dumps(params, sort_keys=True))
+    if key in _response_cache:
+        return _response_cache[key]
+
+    try:
+        data = _throttled_get(url, params)
     except requests.exceptions.Timeout:
         logger.error(f"Timeout accessing {url}")
         return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error accessing {url}: {str(e)}")
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.error(f"Error accessing {url}: {e}")
         return None
+
+    if len(_response_cache) >= RESPONSE_CACHE_SIZE:
+        _response_cache.pop(next(iter(_response_cache)))  # drop the oldest entry
+    _response_cache[key] = data
+    return data
 
 def get_elevation_data(coords):
     """Get elevation data from USGS National Map API with rate limiting"""
     base_url = "https://epqs.nationalmap.gov/v1/json"
     elevations = []
-    
-    for lat, lon in coords:
-        print("lat", lat)
-        print("lon", lon)
+
+    # Coordinates are (lon, lat), GeoJSON order
+    for lon, lat in coords:
         params = {
-            'x': lat,
-            'y': lon,
+            'x': lon,
+            'y': lat,
             'units': 'Meters',
         }
-        
-        data = rate_limited_get(base_url, str(params))  # Remove headers parameter
-        print("data", data)
-        if data and 'value' in data:
-            elevations.append(data['value'])
-        else:
+
+        data = rate_limited_get(base_url, params)
+        logger.debug(f"Elevation at lon={lon}, lat={lat}: {data}")
+        try:
+            elevations.append(float(data['value']))
+        except (TypeError, KeyError, ValueError):
             elevations.append(None)
-            logger.warning(f"Failed to get elevation for coordinates {lat}, {lon}")
-        
+            logger.warning(f"Failed to get elevation for lon={lon}, lat={lat}")
+
         time.sleep(0.1)
-    
+
     return elevations
 
 def get_landcover_data(coords):
@@ -81,20 +90,21 @@ def get_landcover_data(coords):
     nlcd_url = "https://landcover.usgs.gov/arcgis/rest/services/NLCD_Land_Cover/MapServer/identify"
     landcover_values = []
     
-    for lat, lon in coords:
+    # Coordinates are (lon, lat), GeoJSON order
+    for lon, lat in coords:
         params = {
-            'geometry': {'x': lon, 'y': lat},
+            'geometry': json.dumps({'x': lon, 'y': lat}),
             'geometryType': 'esriGeometryPoint',
             'returnGeometry': False,
             'f': 'json'
         }
         
-        data = rate_limited_get(nlcd_url, str(params))  # Convert params to string
+        data = rate_limited_get(nlcd_url, params)
         if data and data.get('results'):
             landcover_values.append(data['results'][0]['attributes']['Pixel Value'])
         else:
             landcover_values.append(None)
-            logger.warning(f"Failed to get landcover for coordinates {lat}, {lon}")
+            logger.warning(f"Failed to get landcover for lon={lon}, lat={lat}")
         
         time.sleep(0.1)
     
@@ -105,20 +115,21 @@ def get_canopy_data(coords):
     canopy_url = "https://apps.fs.usda.gov/arcx/rest/services/EDW/EDW_TreeCanopyCover_01/MapServer/identify"
     canopy_values = []
     
-    for lat, lon in coords:
+    # Coordinates are (lon, lat), GeoJSON order
+    for lon, lat in coords:
         params = {
-            'geometry': {'x': lon, 'y': lat},
+            'geometry': json.dumps({'x': lon, 'y': lat}),
             'geometryType': 'esriGeometryPoint',
             'returnGeometry': False,
             'f': 'json'
         }
         
-        data = rate_limited_get(canopy_url, str(params))  # Convert params to string
+        data = rate_limited_get(canopy_url, params)
         if data and data.get('results'):
             canopy_values.append(data['results'][0]['attributes']['Percent_Tree_Cover'])
         else:
             canopy_values.append(0)
-            logger.warning(f"Failed to get canopy cover for coordinates {lat}, {lon}")
+            logger.warning(f"Failed to get canopy cover for lon={lon}, lat={lat}")
         
         time.sleep(0.1)
     
@@ -127,40 +138,39 @@ def get_canopy_data(coords):
 def sample_trail_points(geometry, max_points=20):
     """Sample a limited number of points along the trail to reduce API calls"""
     coords = list(geometry.coords)
-    print("coords 2", coords)
     if len(coords) <= max_points:
         return coords
     
     # Sample evenly spaced points
     indices = np.linspace(0, len(coords) - 1, max_points, dtype=int)
-    print("indices", indices)
     return [coords[i] for i in indices]
 
-@lru_cache(maxsize=100)
 def calculate_trail_metrics(trail_id, geometry_wkt):
-    """Calculate hiking metrics with caching based on trail ID"""
+    """Calculate hiking metrics for a trail. Returns None if no elevations could be fetched.
+
+    Not cached here: the underlying API responses are cached by rate_limited_get, and
+    caching this would also cache a result built from failed elevation lookups.
+    """
     try:
         geometry = LineString(wkt.loads(geometry_wkt))
         # Sample fewer points to stay within rate limits
         coords = sample_trail_points(geometry)
-        print("coords", coords)
+        logger.debug(f"Trail {trail_id}: sampled {len(coords)} points")
 
         # Get data from services
         elevations = get_elevation_data(coords)
-        print("elevations", elevations)
+        logger.debug(f"Trail {trail_id}: elevations {elevations}")
+        valid_elevations = [e for e in elevations if e is not None]
+        if not valid_elevations:
+            logger.error(f"No elevation data for trail {trail_id}")
+            return None
 
         # landcover = get_landcover_data(coords)
         # canopy = get_canopy_data(coords)
-        
-        # Calculate basic metrics
-        distances = []
-        for i in range(len(coords) - 1):
-            p1 = Point(coords[i])
-            p2 = Point(coords[i + 1])
-            distances.append(p1.distance(p2))
-        
-        total_distance_km = sum(distances) / 1000
-        print("total_distance_km", total_distance_km)
+
+        # Geodesic length of the full trail (coords are lon/lat degrees), not just the sampled points
+        total_distance_km = GEOD.geometry_length(geometry) / 1000
+        logger.debug(f"Trail {trail_id}: total distance {total_distance_km} km")
         
         # Calculate elevation metrics
         elevation_gain = 0
@@ -180,17 +190,19 @@ def calculate_trail_metrics(trail_id, geometry_wkt):
         total_time_minutes = (base_time_hours + ascent_time + descent_time) * 60
         
         # Calculate calories (basic estimation)
-        avg_elevation = np.mean([e for e in elevations if e is not None])
+        avg_elevation = float(np.mean(valid_elevations))
         altitude_factor = 1.0 + max(0, (avg_elevation - 2000) / 1000 * 0.1)
         calories = total_time_minutes * 7 * altitude_factor  # Rough estimate of calories per minute hiking
-        
-        # # Calculate difficulty score
-        # difficulty_score = (
-        #     0.3 * min(elevation_gain / 800, 1) +
-        #     0.3 * min(total_distance_km / 8, 1) +
-        #     0.2 * min(avg_elevation / 3500, 1) +
-        #     0.2 * (np.mean([c for c in canopy if c is not None] or [0]) / 100)
-        # ) * 10
+
+        # Difficulty score (0-10). The canopy term is 0 while get_canopy_data is
+        # disabled, so scores currently top out at 8.
+        canopy = []  # get_canopy_data(coords)
+        difficulty_score = (
+            0.3 * min(elevation_gain / 800, 1) +
+            0.3 * min(total_distance_km / 8, 1) +
+            0.2 * min(avg_elevation / 3500, 1) +
+            0.2 * (np.mean([c for c in canopy if c is not None] or [0]) / 100)
+        ) * 10
 
         return {
             'distance_km': total_distance_km,
@@ -198,7 +210,7 @@ def calculate_trail_metrics(trail_id, geometry_wkt):
             'elevation_loss_m': elevation_loss,
             'time_minutes': total_time_minutes,
             'calories': calories,
-            # 'difficulty_score': difficulty_score
+            'difficulty_score': float(difficulty_score),
         }
     except Exception as e:
         logger.error(f"Error calculating metrics for trail {trail_id}: {str(e)}")
@@ -216,7 +228,6 @@ def show_map():
             tiles='OpenStreetMap',  # Using OpenStreetMap as default for now
             attr='Map tiles by <a href="http://stamen.com">Stamen Design</a>, under CC BY 4.0. Data by <a href="http://openstreetmap.org">OpenStreetMap</a>, under ODbL.'
         )
-        print("m", m)
         # Add controls
         # folium.Scale().add_to(m)
         # plugins.Fullscreen().add_to(m)
@@ -232,17 +243,13 @@ def show_map():
             'f': 'geojson'
         }
         
-        trails_data = rate_limited_get(
-            trails_url, 
-            str(params) if params else None
-        )
-        print("trails_data", trails_data)
+        trails_data = rate_limited_get(trails_url, params)
 
         if not trails_data:
             return "Error loading trail data. Please try again later.", 503
         
         trails_gdf = gpd.GeoDataFrame.from_features(trails_data['features'])
-        print("trails_gdf", trails_gdf)
+        logger.debug(f"Loaded {len(trails_gdf)} trails")
 
         # # Create feature groups for different metrics
         # time_group = folium.FeatureGroup(name='Hiking Time')
@@ -339,7 +346,11 @@ def show_map():
                 });
                 
                 const metrics = await response.json();
-                
+                if (!response.ok || metrics.error) {
+                    metricsDiv.innerHTML = 'Could not calculate metrics: ' + (metrics.error || response.statusText);
+                    return;
+                }
+
                 metricsDiv.innerHTML = `
                     <b>Distance:</b> ${metrics.distance_km.toFixed(2)} km<br>
                     <b>Elevation Gain:</b> ${metrics.elevation_gain_m.toFixed(1)} m<br>
