@@ -322,7 +322,7 @@ def show_map():
             initial_popup_content = f"""
             <h4>{trail.get('name', f'Trail {idx}')}</h4>
             <div id="metrics-{idx}">
-                <button onclick="calculateMetrics('{idx}', '{trail.geometry.wkt}')">Calculate Trail Metrics</button>
+                <button onclick="calculateMetrics(event, '{idx}', '{trail.geometry.wkt}')">Calculate Trail Metrics</button>
             </div>
             """
             
@@ -341,9 +341,25 @@ def show_map():
         # Add JavaScript to handle metric calculations
         js_code = """
         <script>
-        async function calculateMetrics(trailId, geometryWkt) {
+        // Re-measure the open popup holding this element after its content
+        // changes. Leaflet sizes a popup when it opens, not when its HTML changes.
+        function refreshPopupFor(el) {
+            __MAP__.eachLayer(layer => {
+                if (layer instanceof L.Popup && layer.isOpen() && layer.getElement().contains(el)) {
+                    layer.update();
+                }
+            });
+        }
+
+        async function calculateMetrics(event, trailId, geometryWkt) {
+            // Replacing the button below detaches it from the page before the click
+            // reaches the map, so Leaflet can't tell it came from inside the popup
+            // and closes it. Stop the click here so the popup stays open.
+            event.stopPropagation();
+
             const metricsDiv = document.getElementById(`metrics-${trailId}`);
             metricsDiv.innerHTML = 'Calculating...';
+            refreshPopupFor(metricsDiv);
             
             try {
                 const response = await fetch('/calculate_metrics', {
@@ -360,6 +376,7 @@ def show_map():
                 const metrics = await response.json();
                 if (!response.ok || metrics.error) {
                     metricsDiv.innerHTML = 'Could not calculate metrics: ' + (metrics.error || response.statusText);
+                    refreshPopupFor(metricsDiv);
                     return;
                 }
 
@@ -374,10 +391,11 @@ def show_map():
                 metricsDiv.innerHTML = 'Error calculating metrics';
                 console.error('Error:', error);
             }
+            refreshPopupFor(metricsDiv);
         }
         </script>
-        """
-        
+        """.replace('__MAP__', m.get_name())
+
         m.get_root().html.add_child(folium.Element(js_code))
 
         return m._repr_html_()
