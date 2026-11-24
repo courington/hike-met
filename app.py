@@ -14,7 +14,9 @@ import branca.colormap as cm
 # from colorado_interactive_map import create_interactive_hiking_map
 from ratelimit import limits, sleep_and_retry
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import logging
 from folium import plugins
 
@@ -22,9 +24,16 @@ from folium import plugins
 logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO').upper())
 logger = logging.getLogger(__name__)
 
-# Rate limiting
-CALLS_PER_MINUTE = 6
+# Rate limiting, shared by all outbound API calls. USGS doesn't publish a limit
+# for EPQS; one request a second stays well under the 5-10/s other USGS
+# services suggest. HTTP 429s are logged and not cached, so they're retried.
+CALLS_PER_MINUTE = 60
 RESPONSE_CACHE_SIZE = 1000
+
+# Elevation lookups run in parallel because EPQS latency (often several seconds
+# per point), not the rate limit, is what makes a trail slow. Every request still
+# goes through the shared rate limiter.
+ELEVATION_WORKERS = 5
 
 # (connect, read) timeouts in seconds. EPQS often takes 14-17s to answer for a
 # point it hasn't been asked about recently, so the read timeout needs headroom.
@@ -36,6 +45,7 @@ GEOD = Geod(ellps='WGS84')
 # Successful responses only, keyed by (url, sorted params JSON), so a
 # timeout or error is retried on the next request instead of being cached.
 _response_cache = {}
+_response_cache_lock = threading.Lock()
 
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=60)
@@ -47,8 +57,9 @@ def _throttled_get(url, params):
 def rate_limited_get(url, params=None):
     """Make a rate-limited, cached GET request. Returns parsed JSON or None on failure."""
     key = (url, json.dumps(params, sort_keys=True))
-    if key in _response_cache:
-        return _response_cache[key]
+    with _response_cache_lock:
+        if key in _response_cache:
+            return _response_cache[key]
 
     try:
         data = _throttled_get(url, params)
@@ -59,35 +70,32 @@ def rate_limited_get(url, params=None):
         logger.error(f"Error accessing {url}: {e}")
         return None
 
-    if len(_response_cache) >= RESPONSE_CACHE_SIZE:
-        _response_cache.pop(next(iter(_response_cache)))  # drop the oldest entry
-    _response_cache[key] = data
+    with _response_cache_lock:
+        if len(_response_cache) >= RESPONSE_CACHE_SIZE:
+            _response_cache.pop(next(iter(_response_cache)))  # drop the oldest entry
+        _response_cache[key] = data
     return data
 
+def _get_elevation(coord):
+    """Elevation in meters for one (lon, lat) point, or None on failure."""
+    lon, lat = coord  # GeoJSON order
+    params = {
+        'x': lon,
+        'y': lat,
+        'units': 'Meters',
+    }
+    data = rate_limited_get("https://epqs.nationalmap.gov/v1/json", params)
+    logger.debug(f"Elevation at lon={lon}, lat={lat}: {data}")
+    try:
+        return float(data['value'])
+    except (TypeError, KeyError, ValueError):
+        logger.warning(f"Failed to get elevation for lon={lon}, lat={lat}")
+        return None
+
 def get_elevation_data(coords):
-    """Get elevation data from USGS National Map API with rate limiting"""
-    base_url = "https://epqs.nationalmap.gov/v1/json"
-    elevations = []
-
-    # Coordinates are (lon, lat), GeoJSON order
-    for lon, lat in coords:
-        params = {
-            'x': lon,
-            'y': lat,
-            'units': 'Meters',
-        }
-
-        data = rate_limited_get(base_url, params)
-        logger.debug(f"Elevation at lon={lon}, lat={lat}: {data}")
-        try:
-            elevations.append(float(data['value']))
-        except (TypeError, KeyError, ValueError):
-            elevations.append(None)
-            logger.warning(f"Failed to get elevation for lon={lon}, lat={lat}")
-
-        time.sleep(0.1)
-
-    return elevations
+    """Get elevations from the USGS National Map API, in the same order as coords."""
+    with ThreadPoolExecutor(max_workers=ELEVATION_WORKERS) as pool:
+        return list(pool.map(_get_elevation, coords))
 
 def get_landcover_data(coords):
     """Get landcover data from NLCD with rate limiting"""
